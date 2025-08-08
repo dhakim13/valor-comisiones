@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,7 +11,7 @@ st.caption("MVP • Carga la base mensual y elige distribuidor/mes. Exporta un E
 
 # ---------- Helpers ----------
 def normalize_dn(series):
-    out = series.astype(str).str.replace(r'\\.0$', '', regex=True)
+    out = series.astype(str).str.replace(r'\.0$', '', regex=True)
     def fix(x):
         try:
             if 'e+' in x.lower():
@@ -82,7 +81,7 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
 
     # MiFi / HBB mínimos (MVP; ajustables)
     min_mifi = 110
-    min_mifi_10gb = 120  # (si quieres diferenciar esquema 10GB con bono, se agrega lógica)
+    min_mifi_10gb = 120  # reservado por si luego quieres distinguirlo
     min_hbb = 99
 
     # Suma de recargas por línea en el mes
@@ -125,16 +124,23 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
         'Comisión Cartera total ($)': round(anexo['COMISION_CARTERA_$'].sum(),2)
     }])
 
-    # RESUMEN MES
-    resumen_mes = anexo.groupby('PRODUCTO', as_index=False).agg(
-        Lineas=('DN_NORM','nunique'),
-        Recarga_Mes_$=('RECARGA_TOTAL_MES','sum'),
-        Comision_Mes_$=('COMISION_CARTERA_$','sum')
-    )
-    total_row = pd.DataFrame([{'PRODUCTO':'TOTAL',
-                               'Lineas': resumen_mes['Lineas'].sum(),
-                               'Recarga_Mes_$': resumen_mes['Recarga_Mes_$'].sum(),
-                               'Comision_Mes_$': resumen_mes['Comision_Mes_$'].sum()}])
+    # RESUMEN MES (usar dict en agg para evitar error por nombres con $)
+    resumen_mes = anexo.groupby('PRODUCTO', as_index=False).agg({
+        'DN_NORM': 'nunique',
+        'RECARGA_TOTAL_MES': 'sum',
+        'COMISION_CARTERA_$': 'sum'
+    }).rename(columns={
+        'DN_NORM': 'Lineas',
+        'RECARGA_TOTAL_MES': 'Recarga_Mes_$',
+        'COMISION_CARTERA_$': 'Comision_Mes_$'
+    })
+
+    total_row = pd.DataFrame([{
+        'PRODUCTO': 'TOTAL',
+        'Lineas': resumen_mes['Lineas'].sum(),
+        'Recarga_Mes_$': resumen_mes['Recarga_Mes_$'].sum(),
+        'Comision_Mes_$': resumen_mes['Comision_Mes_$'].sum()
+    }])
     resumen_mes = pd.concat([resumen_mes, total_row], ignore_index=True)
 
     # HISTORIAL ACTIVACIONES (solo mes)
@@ -142,7 +148,7 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
 
     # CARTERA MES (detalle recargas)
     rec_det = rec_month_dist.copy()
-    rec_det['ELEGIBLE_MBB'] = rec_det['MONTO']>=min_mbb
+    rec_det['ELEGIBLE_MBB'] = rec_det['MONTO'] >= min_mbb
     rec_det = rec_det[['FECHA','DN_NORM','PLAN','MONTO','FORMA DE PAGO','ELEGIBLE_MBB']].rename(columns={'DN_NORM':'DN'}).sort_values('FECHA')
 
     # Export to Excel in-memory
@@ -181,3 +187,5 @@ if base_file and st.button("Generar reporte"):
             st.download_button("⬇️ Descargar Excel", data=buf, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
         st.exception(e)
+
+
