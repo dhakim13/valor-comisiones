@@ -22,12 +22,10 @@ def normalize_dn(series):
     return out.apply(fix)
 
 def classify_row(row):
-    # Si el TIPO contiene MOB -> MBB.  Para MiFi/HBB usamos costos de paquete (ajusta si cambian).
     tipo = str(row.get('TIPO','')).upper()
     costo = row.get('COSTO PAQUETE', np.nan)
     if 'MOB' in tipo:
         return 'MBB'
-    # Ajusta estos valores si cambian los costos de paquete
     if costo in [99, 115, 349, 399, 439, 500]:
         return 'HBB'
     if costo in [110, 120, 160, 245, 375, 480, 620]:
@@ -74,14 +72,10 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
     tot_dist['PRODUCTO'] = tot_dist.apply(classify_row, axis=1)
 
     # ----- Reglas -----
-    # MBB
     n_altas = altas_mes['DN_NORM'].nunique()
     pct_mbb = cartera_pct_mbb(n_altas)
     min_mbb = 35
-
-    # MiFi / HBB mínimos (MVP; ajustables)
     min_mifi = 110
-    min_mifi_10gb = 120  # reservado por si luego quieres distinguirlo
     min_hbb = 99
 
     # Suma de recargas por línea en el mes
@@ -91,7 +85,6 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
     anexo = tot_dist[['DN','DN_NORM','FECHA','PLAN','COSTO PAQUETE','PRODUCTO']].merge(rec_by_dn, on='DN_NORM', how='left')
     anexo['RECARGA_TOTAL_MES'] = anexo['RECARGA_TOTAL_MES'].fillna(0.0)
 
-    # Elegibilidad y % por producto
     def elegible(row):
         if row['PRODUCTO'] == 'MBB':
             return row['RECARGA_TOTAL_MES'] >= min_mbb
@@ -103,12 +96,11 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
 
     anexo['ELEGIBLE_CARTERA'] = anexo.apply(elegible, axis=1)
 
-    # % aplicado
     def pct_aplicado(row):
         if row['PRODUCTO'] == 'MBB':
             return pct_mbb
         elif row['PRODUCTO'] in ('MiFi','HBB'):
-            return 0.05  # M1–12 a 5% en ambos (base)
+            return 0.05
         return 0.0
 
     anexo['% CARTERA APLICADA'] = anexo.apply(pct_aplicado, axis=1)
@@ -124,7 +116,7 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
         'Comisión Cartera total ($)': round(anexo['COMISION_CARTERA_$'].sum(),2)
     }])
 
-    # RESUMEN MES (usar dict en agg para evitar error por nombres con $)
+    # RESUMEN MES
     resumen_mes = anexo.groupby('PRODUCTO', as_index=False).agg({
         'DN_NORM': 'nunique',
         'RECARGA_TOTAL_MES': 'sum',
@@ -143,15 +135,15 @@ def calc_report(df_tot, df_rec, dist_name, year, month):
     }])
     resumen_mes = pd.concat([resumen_mes, total_row], ignore_index=True)
 
-    # HISTORIAL ACTIVACIONES (solo mes)
+    # HISTORIAL ACTIVACIONES
     hist = altas_mes[['FECHA','DN_NORM','PLAN','COSTO PAQUETE']].rename(columns={'DN_NORM':'DN'}).sort_values('FECHA')
 
-    # CARTERA MES (detalle recargas)
+    # CARTERA MES
     rec_det = rec_month_dist.copy()
     rec_det['ELEGIBLE_MBB'] = rec_det['MONTO'] >= min_mbb
     rec_det = rec_det[['FECHA','DN_NORM','PLAN','MONTO','FORMA DE PAGO','ELEGIBLE_MBB']].rename(columns={'DN_NORM':'DN'}).sort_values('FECHA')
 
-    # Export to Excel in-memory
+    # Export to Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         resumen.to_excel(writer, sheet_name='RESUMEN', index=False)
@@ -175,12 +167,12 @@ with col2:
 
 if base_file and st.button("Generar reporte"):
     try:
-        xls = pd.ExcelFile(base_file)
+        xls = pd.ExcelFile(base_file, engine="openpyxl")
         if 'Desgloce Totales' not in xls.sheet_names or 'Desgloce Recarga' not in xls.sheet_names:
             st.error("El archivo base debe contener las hojas 'Desgloce Totales' y 'Desgloce Recarga'.")
         else:
-            df_tot = pd.read_excel(base_file, sheet_name='Desgloce Totales', header=1)
-            df_rec = pd.read_excel(base_file, sheet_name='Desgloce Recarga', header=3)
+            df_tot = pd.read_excel(base_file, sheet_name='Desgloce Totales', header=1, engine="openpyxl")
+            df_rec = pd.read_excel(base_file, sheet_name='Desgloce Recarga', header=3, engine="openpyxl")
             buf = calc_report(df_tot, df_rec, dist, int(year), int(month))
             fname = f"COMISION VALOR DISTRIBUIDOR {dist.upper()} {datetime(int(year), int(month), 1).strftime('%B').upper()} {year}.xlsx"
             st.success("Reporte generado.")
