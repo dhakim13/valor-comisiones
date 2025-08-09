@@ -283,21 +283,19 @@ def calc_report(df_tot: pd.DataFrame, df_rec: pd.DataFrame, dist_name: str, year
     }])
 
     # ======= RESUMEN MES por esquema =======
-    resumen_mes = (
-        anexo.groupby("ESQUEMA", as_index=False)
-        .agg(
-            Lineas=("DN_NORM", "nunique"),
-            Recarga_Mes_$=("RECARGA_TOTAL_MES", "sum"),
-            Comision_Mes_$=("COMISION_TOTAL_MES", "sum"),
-        )
-    )
-    total_row = pd.DataFrame([{
-        "ESQUEMA": "TOTAL",
-        "Lineas": resumen_mes["Lineas"].sum() if not resumen_mes.empty else 0,
-        "Recarga_Mes_$": resumen_mes["Recarga_Mes_$"].sum() if not resumen_mes.empty else 0.0,
-        "Comision_Mes_$": resumen_mes["Comision_Mes_$"].sum() if not resumen_mes.empty else 0.0,
-    }])
-    resumen_mes = pd.concat([resumen_mes, total_row], ignore_index=True)
+   resumen_mes = (
+    anexo.groupby("ESQUEMA", as_index=False)
+    .agg({
+        "DN_NORM": "nunique",
+        "RECARGA_TOTAL_MES": "sum",
+        "COMISION_TOTAL_MES": "sum",
+    })
+    .rename(columns={
+        "DN_NORM": "Lineas",
+        "RECARGA_TOTAL_MES": "Recarga_Mes_$",
+        "COMISION_TOTAL_MES": "Comision_Mes_$",
+    })
+)
 
     # ======= HISTORIAL DE ACTIVACIONES (solo mes) =======
     hist = altas_mes[[colF_TOT, "DN_NORM", colPLAN, colCOSTO, "ESQUEMA"]].rename(
