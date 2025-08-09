@@ -3,368 +3,395 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 from datetime import datetime
+import unicodedata
 
 st.set_page_config(page_title="Valor Telecom - Comisiones", page_icon="📊", layout="wide")
 st.title("📊 Generador de Comisiones | Valor Telecom")
-st.caption("Sube la base mensual y el HISTORIAL del distribuidor. Calcula comisiones por esquema con ventanas M, M+1, M+2, M3–12 y exporta Excel final.")
+st.caption("MVP • Sube la base mensual y el historial del distribuidor. Exporta un Excel con RESUMEN, ANEXO, HISTORIAL (mes), RESUMEN MES y CARTERA MES.")
 
-# =========================
-# Helpers
-# =========================
-def normalize_dn(series):
-    out = series.astype(str).str.replace(r'\.0$', '', regex=True)
+# ========== Utilidades de normalización ==========
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+def norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [
+        _strip_accents(str(c)).strip().upper().replace("\n", " ").replace("  ", " ")
+        for c in df.columns
+    ]
+    return df
+
+def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = list(df.columns)
+    for cand in candidates:
+        uc = _strip_accents(cand).strip().upper()
+        for c in cols:
+            if _strip_accents(str(c)).strip().upper() == uc:
+                return c
+    return None
+
+def normalize_dn(series: pd.Series) -> pd.Series:
+    out = series.astype(str).str.replace(r"\.0$", "", regex=True)
     def fix(x):
         try:
-            if 'e+' in x.lower():
+            if "e+" in x.lower():
                 return str(int(float(x)))
-            return x.split('.')[0]
-        except:
+            return x.split(".")[0]
+        except Exception:
             return x
     return out.apply(fix)
 
-def classify_producto(row):
-    # Fallback por costo/identificadores cuando no hay ESQUEMA
-    tipo = str(row.get('TIPO', '')).upper()
-    costo = row.get('COSTO PAQUETE', np.nan)
-    if 'MOB' in tipo:
-        return 'MBB'
+# ========== Clasificación y reglas ==========
+def classify_row(row):
+    tipo = str(row.get("TIPO","")).upper()
+    costo = row.get("COSTO PAQUETE", np.nan)
+    if "MOB" in tipo:
+        return "MBB"
+    # HBB por costos típicos
     if costo in [99, 115, 349, 399, 439, 500]:
-        return 'HBB'
+        return "HBB"
+    # MiFi por costos típicos
     if costo in [110, 120, 160, 245, 375, 480, 620]:
-        return 'MiFi'
-    return 'MBB'
+        return "MiFi"
+    return "MBB"
 
 def cartera_pct_mbb(n_altas_mes):
-    # Ajuste por volumen del mes (no adicional): <50 = 3%, 50–299 = 5%, 300–499 = 7%, 500–999 = 8%, >=1000 = 10%
-    if n_altas_mes < 50:
-        return 0.03
-    elif n_altas_mes < 300:
-        return 0.05
-    elif n_altas_mes < 500:
-        return 0.07
-    elif n_altas_mes < 1000:
-        return 0.08
-    else:
-        return 0.10
+    if n_altas_mes < 50:   return 0.03
+    if n_altas_mes < 300:  return 0.05
+    if n_altas_mes < 500:  return 0.07
+    if n_altas_mes < 1000: return 0.08
+    return 0.10
 
-def ventana_m(rec_date, act_date):
-    # Ventanas por días desde la activación (1–30=M, 31–60=M+1, 61–90=M+2, >=91=M3–12)
-    if pd.isna(rec_date) or pd.isna(act_date):
-        return None
-    days = (rec_date - act_date).days + 1
-    if days <= 0:
-        return None
-    if days <= 30:
-        return "M"
-    if days <= 60:
-        return "M+1"
-    if days <= 90:
-        return "M+2"
-    return "M3-12"
+# ========== Lectura robusta de hojas ==========
+def read_with_possible_header(xls, sheet_name, header_try=(0,1,2,3,4)):
+    for h in header_try:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=h, engine="openpyxl")
+            if df is not None and df.shape[1] > 0:
+                return df
+        except Exception:
+            continue
+    # último intento con header por defecto
+    return pd.read_excel(xls, sheet_name=sheet_name, engine="openpyxl")
 
-# =========================
-# Reglas por esquema
-# =========================
-MIN_MBB  = 35
-MIN_MIFI = 110
-MIN_MIFI_10GB = 120
-MIN_HBB  = 99
+def load_base(base_file):
+    xls = pd.ExcelFile(base_file, engine="openpyxl")
+    # nombres fijos por tu confirmación
+    if "Desgloce Totales" not in xls.sheet_names or "Desgloce Recarga" not in xls.sheet_names:
+        raise ValueError("El archivo base debe tener hojas 'Desgloce Totales' y 'Desgloce Recarga'.")
+    df_tot = pd.read_excel(xls, sheet_name="Desgloce Totales", header=1, engine="openpyxl")
+    df_rec = pd.read_excel(xls, sheet_name="Desgloce Recarga", header=3, engine="openpyxl")
 
-def tasa_por_esquema(esquema:str, ventana:str):
-    # Devuelve porcentaje aplicable según esquema y ventana
-    if not esquema:
-        return None
-    e = esquema.strip().lower()
-    v = (ventana or "").upper()
+    df_tot = norm_cols(df_tot)
+    df_rec = norm_cols(df_rec)
 
-    # MiFi con equipo (esquema 1): 10%/15%/10%/5%
-    if e in ["mifi equipo", "mifi con equipo", "mifi (equipo)"]:
-        return {"M":0.10, "M+1":0.15, "M+2":0.10, "M3-12":0.05}.get(v, 0.0)
+    # Renombres estándar esperados
+    # DN
+    dn_tot = pick_col(df_tot, ["DN","NUMERO","LINEA","MSISDN"])
+    if dn_tot and dn_tot != "DN": df_tot.rename(columns={dn_tot:"DN"}, inplace=True)
+    dn_rec = pick_col(df_rec, ["DN","NUMERO","LINEA","MSISDN"])
+    if dn_rec and dn_rec != "DN": df_rec.rename(columns={dn_rec:"DN"}, inplace=True)
 
-    # MiFi Solo SIM: 5% M1–12
-    if e in ["mifi solo sim", "mifi sim", "mifi (sim)"]:
-        return 0.05
+    # FECHA (activación en totales)
+    fecha_tot = pick_col(df_tot, ["FECHA","FECHA ALTA","FECHA ACTIVACION","ALTA"])
+    if fecha_tot and fecha_tot != "FECHA": df_tot.rename(columns={fecha_tot:"FECHA"}, inplace=True)
 
-    # MiFi 10GB + 1a recarga: 5% M1–12  (el bono de $50 se trata aparte)
-    if e in ["mifi 10gb + 1a recarga", "mifi 10gb", "mifi 10gb primera recarga"]:
-        return 0.05
+    # FECHA (recarga en recargas)
+    fecha_rec = pick_col(df_rec, ["FECHA","FECHA RECARGA","FECHA DE RECARGA"])
+    if fecha_rec and fecha_rec != "FECHA": df_rec.rename(columns={fecha_rec:"FECHA"}, inplace=True)
 
-    # HBB con equipo: 5% M1–12
-    if e in ["hbb equipo", "hbb con equipo", "hbb (equipo)"]:
-        return 0.05
+    # MONTO
+    monto_rec = pick_col(df_rec, ["MONTO","IMPORTE","MONTO RECARGA","CANTIDAD"])
+    if monto_rec and monto_rec != "MONTO": df_rec.rename(columns={monto_rec:"MONTO"}, inplace=True)
 
-    # HBB Solo SIM: 5% M1–12
-    if e in ["hbb solo sim", "hbb sim", "hbb (sim)"]:
-        return 0.05
+    # PLAN / COSTO PAQUETE / FORMA DE PAGO / DISTRIBUIDOR
+    plan_tot = pick_col(df_tot, ["PLAN","PLAN TARIFARIO"])
+    if plan_tot and plan_tot != "PLAN": df_tot.rename(columns={plan_tot:"PLAN"}, inplace=True)
+    costo_tot = pick_col(df_tot, ["COSTO PAQUETE","COSTO DEL PAQUETE","PAQUETE"])
+    if costo_tot and costo_tot != "COSTO PAQUETE": df_tot.rename(columns={costo_tot:"COSTO PAQUETE"}, inplace=True)
+    tipo_tot = pick_col(df_tot, ["TIPO","TIPO PRODUCTO","PRODUCTO"])
+    if tipo_tot and tipo_tot != "TIPO": df_tot.rename(columns={tipo_tot:"TIPO"}, inplace=True)
+    dist_tot = pick_col(df_tot, ["DISTRIBUIDOR ","DISTRIBUIDOR"])  # hay versión con espacio al final
+    if dist_tot and dist_tot != "DISTRIBUIDOR ":
+        df_tot.rename(columns={dist_tot:"DISTRIBUIDOR "}, inplace=True)
 
-    # MBB: la tasa se define por volumen (se asigna fuera)
-    if e == "mbb":
-        return None
+    forma_rec = pick_col(df_rec, ["FORMA DE PAGO","METODO DE PAGO","PAGO"])
+    if forma_rec and forma_rec != "FORMA DE PAGO": df_rec.rename(columns={forma_rec:"FORMA DE PAGO"}, inplace=True)
 
-    # Si no coincide, None
-    return None
+    # Normalizaciones finales
+    for df in (df_tot, df_rec):
+        if "DN" in df.columns:
+            df["DN_NORM"] = normalize_dn(df["DN"])
+    if "FECHA" in df_tot.columns:
+        df_tot["FECHA"] = pd.to_datetime(df_tot["FECHA"], errors="coerce")
+    if "FECHA" in df_rec.columns:
+        df_rec["FECHA"] = pd.to_datetime(df_rec["FECHA"], errors="coerce")
 
-def minimo_por_esquema(esquema:str):
-    if not esquema:
-        return None
-    e = esquema.strip().lower()
-    if e in ["mifi equipo", "mifi con equipo", "mifi (equipo)", "mifi solo sim", "mifi sim", "mifi (sim)"]:
-        return MIN_MIFI
-    if e in ["mifi 10gb + 1a recarga", "mifi 10gb", "mifi 10gb primera recarga"]:
-        return MIN_MIFI_10GB
-    if e in ["hbb equipo", "hbb con equipo", "hbb (equipo)", "hbb solo sim", "hbb sim", "hbb (sim)"]:
-        return MIN_HBB
-    if e == "mbb":
-        return MIN_MBB
-    return None
+    return df_tot, df_rec
 
-# =========================
-# Cálculo de reporte
-# =========================
-def calc_report(df_tot, df_rec, df_hist_act=None, df_hist_rec=None, dist_name="ActivateCel", year=2025, month=6):
+def load_historial(hist_file):
+    """Leemos todas las hojas del historial y juntamos:
+       - Activaciones (si vienen)
+       - Recargas (si vienen)
+       Renombramos columnas equivalentes a FECHA / MONTO / DN / PLAN
+    """
+    xls = pd.ExcelFile(hist_file, engine="openpyxl")
+    rec_list = []
+    act_list = []
+
+    for sh in xls.sheet_names:
+        try:
+            df = read_with_possible_header(xls, sh, header_try=(0,1,2,3,4))
+            df = norm_cols(df)
+
+            # detectar DN
+            dn_col = pick_col(df, ["DN","NUMERO","LINEA","MSISDN"])
+            if not dn_col: 
+                continue
+            if dn_col != "DN": df.rename(columns={dn_col:"DN"}, inplace=True)
+
+            # detectar FECHA
+            fecha_col = pick_col(df, ["FECHA","FECHA RECARGA","FECHA DE RECARGA","FECHA DE PAGO","FECHA_PAGO","FECHA "])
+            if fecha_col:
+                if fecha_col != "FECHA": df.rename(columns={fecha_col:"FECHA"}, inplace=True)
+                df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+
+            # detectar MONTO (para recargas)
+            monto_col = pick_col(df, ["MONTO","IMPORTE","MONTO RECARGA","CANTIDAD","PAGO"])
+            if monto_col and monto_col != "MONTO":
+                df.rename(columns={monto_col:"MONTO"}, inplace=True)
+
+            # PLAN si existiera
+            plan_col = pick_col(df, ["PLAN","PLAN TARIFARIO"])
+            if plan_col and plan_col != "PLAN":
+                df.rename(columns={plan_col:"PLAN"}, inplace=True)
+
+            # Heurística: si trae MONTO y FECHA, lo consideramos recargas
+            if "FECHA" in df.columns and "MONTO" in df.columns:
+                sub = df[["FECHA","DN","MONTO"] + ([ "PLAN" ] if "PLAN" in df.columns else [])].copy()
+                rec_list.append(sub)
+            # Heurística de activaciones: presencia de FECHA + PLAN, o columnas típicas
+            elif "FECHA" in df.columns and ("PLAN" in df.columns or "COSTO PAQUETE" in df.columns):
+                keep = ["FECHA","DN"]
+                if "PLAN" in df.columns: keep.append("PLAN")
+                if "COSTO PAQUETE" in df.columns: keep.append("COSTO PAQUETE")
+                act_list.append(df[keep].copy())
+
+        except Exception:
+            continue
+
+    rec_hist = pd.concat(rec_list, ignore_index=True) if rec_list else pd.DataFrame(columns=["FECHA","DN","MONTO","PLAN"])
+    act_hist = pd.concat(act_list, ignore_index=True) if act_list else pd.DataFrame(columns=["FECHA","DN","PLAN","COSTO PAQUETE"])
+
+    # DN normalizado
+    for d in (rec_hist, act_hist):
+        if "DN" in d.columns:
+            d["DN_NORM"] = normalize_dn(d["DN"])
+
+    return act_hist, rec_hist
+
+# ========== Cálculo del reporte ==========
+def calc_report(df_tot, df_rec, dist_name, year, month, act_hist=None, rec_hist=None):
     month_start = pd.Timestamp(year, month, 1)
     month_end   = pd.Timestamp(year, month, 1) + pd.offsets.MonthEnd(1)
 
-    # Normalización
-    def prep(df):
-        d = df.copy()
-        if 'FECHA' in d.columns:
-            d['FECHA'] = pd.to_datetime(d['FECHA'], errors='coerce')
-        if 'DN' in d.columns:
-            d['DN_NORM'] = normalize_dn(d['DN'])
-        return d
-
-    df_tot = prep(df_tot)
-    df_rec = prep(df_rec)
-
-    # Filtro distribuidor en totales
-    mask_dist = df_tot['DISTRIBUIDOR '].astype(str).str.strip().str.lower() == dist_name.lower()
+    # Universo distribuidor con base mensual
+    df_tot = df_tot.copy()
+    df_rec = df_rec.copy()
+    mask_dist = df_tot["DISTRIBUIDOR "].astype(str).str.strip().str.lower() == dist_name.lower()
     tot_dist = df_tot[mask_dist].copy()
 
-    # PRODUCTO base
-    if 'PRODUCTO' not in tot_dist.columns:
-        tot_dist['PRODUCTO'] = tot_dist.apply(classify_producto, axis=1)
+    # Normalización de fechas
+    if "FECHA" in df_rec.columns:
+        df_rec["FECHA"] = pd.to_datetime(df_rec["FECHA"], errors="coerce")
+    if "FECHA" in tot_dist.columns:
+        tot_dist["FECHA"] = pd.to_datetime(tot_dist["FECHA"], errors="coerce")
 
-    # Incorporar HISTORIAL (si viene)
-    hist_act = prep(df_hist_act) if df_hist_act is not None else pd.DataFrame(columns=['DN','FECHA'])
-    hist_rec = prep(df_hist_rec) if df_hist_rec is not None else pd.DataFrame(columns=['DN','FECHA','MONTO'])
+    dns_dist = set(tot_dist["DN_NORM"].dropna())
 
-    # Fecha de activación real por DN (mínima fecha entre historial y totales del dist)
-    act_src = pd.concat([
-        tot_dist[['DN_NORM','FECHA']],
-        hist_act[['DN_NORM','FECHA']] if 'DN_NORM' in hist_act.columns else pd.DataFrame(columns=['DN_NORM','FECHA'])
-    ], ignore_index=True).dropna(subset=['DN_NORM','FECHA'])
+    # Activaciones del mes (base)
+    altas_mes_base = tot_dist[(tot_dist["FECHA"]>=month_start) & (tot_dist["FECHA"]<=month_end)].copy()
 
-    act_dates = act_src.groupby('DN_NORM', as_index=False)['FECHA'].min().rename(columns={'FECHA':'FECHA_ACTIVACION'})
+    # Recargas del mes (base) solo de esas DN
+    rec_month_base = df_rec[(df_rec["FECHA"]>=month_start) & (df_rec["FECHA"]<=month_end)].copy()
+    rec_month_base = rec_month_base[rec_month_base["DN_NORM"].isin(dns_dist)].copy()
 
-    # Universo DN del distribuidor
-    dns_dist = set(tot_dist['DN_NORM'].dropna())
-
-    # Recargas del mes (de DF base + historial si trae)
-    rec_month_base = df_rec[(df_rec['FECHA']>=month_start) & (df_rec['FECHA']<=month_end)].copy()
-    rec_month_hist = hist_rec[(hist_rec['FECHA']>=month_start) & (hist_rec['FECHA']<=month_end)].copy() if not hist_rec.empty else pd.DataFrame(columns=rec_month_base.columns)
-
-    rec_month = pd.concat([rec_month_base, rec_month_hist], ignore_index=True)
-    rec_month = rec_month[rec_month['DN_NORM'].isin(dns_dist)].copy()
-
-    # Enriquecer con datos de totales (PLAN, COSTO, PRODUCTO, y ESQUEMA si existe en historial de activaciones)
-    base_cols = [c for c in ['DN_NORM','PLAN','COSTO PAQUETE','PRODUCTO'] if c in tot_dist.columns]
-    rec_month = rec_month.merge(tot_dist[base_cols].drop_duplicates('DN_NORM'), on='DN_NORM', how='left')
-
-    # Traer ESQUEMA si el historial de activaciones lo trae
-    if 'ESQUEMA' in hist_act.columns:
-        esquemas = hist_act[['DN_NORM','ESQUEMA']].dropna().drop_duplicates('DN_NORM')
-        rec_month = rec_month.merge(esquemas, on='DN_NORM', how='left')
+    # Historial: combinar si viene info válida
+    if act_hist is not None and not act_hist.empty:
+        act_hist = act_hist.copy()
+        if "FECHA" in act_hist.columns:
+            act_hist["FECHA"] = pd.to_datetime(act_hist["FECHA"], errors="coerce")
+        act_hist = act_hist[act_hist["DN_NORM"].isin(dns_dist)]
+        altas_mes_hist = act_hist[(act_hist["FECHA"]>=month_start) & (act_hist["FECHA"]<=month_end)].copy()
     else:
-        # Fallback: usar PRODUCTO como esquema base cuando no se especifica
-        rec_month['ESQUEMA'] = rec_month.get('PRODUCTO', 'MBB')
+        altas_mes_hist = pd.DataFrame(columns=altas_mes_base.columns)
 
-    # Agregar fecha de activación
-    rec_month = rec_month.merge(act_dates, on='DN_NORM', how='left')
-
-    # Ventana M
-    rec_month['VENTANA'] = rec_month.apply(lambda r: ventana_m(r['FECHA'], r['FECHA_ACTIVACION']), axis=1)
-
-    # Altas del MES (para MBB % volumen -> contar DN con FECHA en mes_start..end en tot_dist)
-    altas_mes = tot_dist[(tot_dist['FECHA']>=month_start) & (tot_dist['FECHA']<=month_end)].copy()
-    n_altas_mes = altas_mes['DN_NORM'].nunique()
-    pct_mbb = cartera_pct_mbb(n_altas_mes)
-
-    # Cálculo de comisión por transacción de recarga
-    def comision_row(row):
-        monto = row.get('MONTO', 0.0) or 0.0
-        esquema = str(row.get('ESQUEMA', '') or '').strip()
-        producto = str(row.get('PRODUCTO', '') or '').strip()
-        ventana = row.get('VENTANA', None)
-
-        # Mínimo por esquema
-        minimo = minimo_por_esquema(esquema)
-        if minimo is None:
-            # Si no hay esquema, usar mínimo por PRODUCTO
-            minimo = MIN_MBB if producto.upper() == 'MBB' else (MIN_HBB if producto.upper() == 'HBB' else MIN_MIFI)
-
-        if monto < minimo:
-            return 0.0
-
-        # MBB: tasa por volumen
-        if esquema.lower() == 'mbb' or producto.upper() == 'MBB':
-            return round(monto * pct_mbb, 2)
-
-        # MiFi/HBB: tasa por esquema/ventana
-        tasa = tasa_por_esquema(esquema, ventana)
-        if tasa is None:
-            # fallback 5% si no se pudo identificar el esquema concreto
-            tasa = 0.05
-        return round(monto * tasa, 2)
-
-    rec_month['COMISION_TX'] = rec_month.apply(comision_row, axis=1)
-
-    # Bono MiFi 10GB + 1a recarga (50 pesos si la primera recarga cae entre día 31–60)
-    def bono_mifi_10gb(df):
-        # detectar primera recarga por DN
-        df_sorted = df.sort_values(['DN_NORM','FECHA'])
-        first_rec = df_sorted.groupby('DN_NORM', as_index=False).first()
-        cond_esquema = df_sorted['ESQUEMA'].str.strip().str.lower().isin(['mifi 10gb + 1a recarga','mifi 10gb','mifi 10gb primera recarga'])
-        # calcular días de la primera recarga
-        fr = df_sorted[cond_esquema].sort_values(['DN_NORM','FECHA']).groupby('DN_NORM', as_index=False).first()
-        if fr.empty:
-            return pd.DataFrame(columns=['DN_NORM','BONO_50'])
-        fr['DIAS'] = (fr['FECHA'] - fr['FECHA_ACTIVACION']).dt.days + 1
-        fr['BONO_50'] = np.where(fr['DIAS'].between(31,60, inclusive='both'), 50.0, 0.0)
-        return fr[['DN_NORM','BONO_50']]
-
-    bonos = bono_mifi_10gb(rec_month)
-    if not bonos.empty:
-        # bono por DN (no por transacción); lo sumamos al final por DN
-        pass
-
-    # ---- ANEXO (por línea en el mes) ----
-    # Suma de recargas y comisiones por DN dentro del mes
-    dn_agg = rec_month.groupby('DN_NORM', as_index=False).agg({
-        'MONTO': 'sum',
-        'COMISION_TX': 'sum'
-    }).rename(columns={'MONTO':'RECARGA_TOTAL_MES','COMISION_TX':'COMISION_TOTAL_MES'})
-
-    # Traer plan/costo/producto/esquema representativo por DN
-    dn_info = rec_month.sort_values('FECHA').groupby('DN_NORM', as_index=False).last()[['DN_NORM','PLAN','COSTO PAQUETE','PRODUCTO','ESQUEMA']]
-    anexo = dn_info.merge(dn_agg, on='DN_NORM', how='left').fillna({'RECARGA_TOTAL_MES':0.0,'COMISION_TOTAL_MES':0.0})
-
-    # Añadir bono 50 (MiFi 10GB) por DN si corresponde
-    if not bonos.empty:
-        anexo = anexo.merge(bonos, on='DN_NORM', how='left')
-        anexo['BONO_50'] = anexo['BONO_50'].fillna(0.0)
-        anexo['COMISION_TOTAL_MES'] = (anexo['COMISION_TOTAL_MES'] + anexo['BONO_50']).round(2)
+    if rec_hist is not None and not rec_hist.empty:
+        rec_hist = rec_hist.copy()
+        if "FECHA" in rec_hist.columns:
+            rec_hist["FECHA"] = pd.to_datetime(rec_hist["FECHA"], errors="coerce")
+        rec_hist = rec_hist[rec_hist["DN_NORM"].isin(dns_dist)]
+        rec_month_hist = rec_hist[(rec_hist["FECHA"]>=month_start) & (rec_hist["FECHA"]<=month_end)].copy()
     else:
-        anexo['BONO_50'] = 0.0
+        rec_month_hist = pd.DataFrame(columns=rec_month_base.columns if not rec_month_base.empty else ["FECHA","DN","MONTO","DN_NORM"])
 
-    # RESUMEN general
+    # Unimos (preferencia: sumar ambas fuentes)
+    altas_mes = pd.concat([altas_mes_base, altas_mes_hist], ignore_index=True) if not altas_mes_hist.empty else altas_mes_base
+    rec_month = pd.concat([rec_month_base, rec_month_hist], ignore_index=True) if not rec_month_hist.empty else rec_month_base
+
+    # Clasificación y mínimos
+    tot_dist["PRODUCTO"] = tot_dist.apply(classify_row, axis=1)
+    n_altas = altas_mes["DN_NORM"].nunique()
+    pct_mbb = cartera_pct_mbb(n_altas)
+    min_mbb, min_mifi, min_hbb = 35, 110, 99
+
+    # Suma recargas por DN en el mes
+    if rec_month.empty:
+        rec_by_dn = pd.DataFrame({"DN_NORM": list(dns_dist), "RECARGA_TOTAL_MES": 0.0})
+    else:
+        rec_by_dn = (
+            rec_month.groupby("DN_NORM", as_index=False)["MONTO"]
+            .sum()
+            .rename(columns={"MONTO":"RECARGA_TOTAL_MES"})
+        )
+
+    # ANEXO
+    keep_cols = [c for c in ["DN","DN_NORM","FECHA","PLAN","COSTO PAQUETE","PRODUCTO"] if c in tot_dist.columns]
+    anexo = tot_dist[keep_cols].merge(rec_by_dn, on="DN_NORM", how="left")
+    anexo["RECARGA_TOTAL_MES"] = anexo["RECARGA_TOTAL_MES"].fillna(0.0)
+
+    # Elegibilidad
+    def elegible(row):
+        if row["PRODUCTO"] == "MBB":
+            return row["RECARGA_TOTAL_MES"] >= min_mbb
+        elif row["PRODUCTO"] == "MiFi":
+            return row["RECARGA_TOTAL_MES"] >= min_mifi
+        elif row["PRODUCTO"] == "HBB":
+            return row["RECARGA_TOTAL_MES"] >= min_hbb
+        return False
+    anexo["ELEGIBLE_CARTERA"] = anexo.apply(elegible, axis=1)
+
+    # % aplicado
+    def pct_aplicado(row):
+        if row["PRODUCTO"] == "MBB":
+            return pct_mbb
+        elif row["PRODUCTO"] in ("MiFi","HBB"):
+            return 0.05  # base M1–12
+        return 0.0
+    anexo["% CARTERA APLICADA"] = anexo.apply(pct_aplicado, axis=1)
+    anexo["COMISION_CARTERA_$"] = np.where(
+        anexo["ELEGIBLE_CARTERA"],
+        anexo["RECARGA_TOTAL_MES"] * anexo["% CARTERA APLICADA"],
+        0.0
+    ).round(2)
+
+    # RESUMEN
     resumen = pd.DataFrame([{
-        'Distribuidor': dist_name,
-        'Mes': f'{month_start.strftime("%B").capitalize()} {year}',
-        'Altas del mes': int(n_altas_mes),
-        'Recargas totales del mes ($)': round(rec_month['MONTO'].sum(), 2),
-        'Porcentaje Cartera aplicado (MBB)': pct_mbb,
-        'Comisión total del mes ($)': round(anexo['COMISION_TOTAL_MES'].sum(), 2)
+        "Distribuidor": dist_name,
+        "Mes": f'{month_start.strftime("%B").capitalize()} {year}',
+        "Altas del mes": int(n_altas),
+        "Recargas totales del mes ($)": round(rec_month["MONTO"].sum() if "MONTO" in rec_month.columns else 0.0, 2),
+        "Porcentaje Cartera aplicado (MBB)": pct_mbb,
+        "Comisión Cartera total ($)": round(anexo["COMISION_CARTERA_$"].sum(), 2)
     }])
 
-    # RESUMEN MES (por ESQUEMA si existe, si no por PRODUCTO)
-    agrupador = 'ESQUEMA' if 'ESQUEMA' in anexo.columns and anexo['ESQUEMA'].notna().any() else 'PRODUCTO'
+    # RESUMEN MES
     resumen_mes = (
-        anexo.groupby(agrupador, as_index=False)
-        .agg({
-            'DN_NORM':'nunique',
-            'RECARGA_TOTAL_MES':'sum',
-            'COMISION_TOTAL_MES':'sum'
-        })
-        .rename(columns={
-            'DN_NORM':'Lineas',
-            'RECARGA_TOTAL_MES':'Recarga_Mes_$',
-            'COMISION_TOTAL_MES':'Comision_Mes_$'
-        })
+        anexo.groupby("PRODUCTO", as_index=False)
+        .agg(Lineas=("DN_NORM","nunique"),
+             Recarga_Mes_$=("RECARGA_TOTAL_MES","sum"),
+             Comision_Mes_$=("COMISION_CARTERA_$","sum"))
     )
     total_row = pd.DataFrame([{
-        agrupador: 'TOTAL',
-        'Lineas': resumen_mes['Lineas'].sum(),
-        'Recarga_Mes_$': resumen_mes['Recarga_Mes_$'].sum(),
-        'Comision_Mes_$': resumen_mes['Comision_Mes_$'].sum()
+        "PRODUCTO": "TOTAL",
+        "Lineas": resumen_mes["Lineas"].sum(),
+        "Recarga_Mes_$": resumen_mes["Recarga_Mes_$"].sum(),
+        "Comision_Mes_$": resumen_mes["Comision_Mes_$"].sum()
     }])
     resumen_mes = pd.concat([resumen_mes, total_row], ignore_index=True)
 
-    # HISTORIAL DE ACTIVACIONES (del distribuidor) -> todas las altas conocidas (historial + totales)
-    hist_altas_dist = pd.concat([
-        tot_dist[['FECHA','DN','DN_NORM','PLAN','COSTO PAQUETE']],
-        hist_act[['FECHA','DN','DN_NORM','PLAN','COSTO PAQUETE']] if not hist_act.empty else pd.DataFrame(columns=['FECHA','DN','DN_NORM','PLAN','COSTO PAQUETE'])
-    ], ignore_index=True).dropna(subset=['DN_NORM','FECHA']).drop_duplicates(subset=['DN_NORM','FECHA']).sort_values('FECHA')
-    hist_altas_dist = hist_altas_dist.rename(columns={'DN_NORM':'DN_STD'})
+    # HISTORIAL ACTIVACIONES (solo mes)
+    if not altas_mes.empty:
+        hist_cols = ["FECHA","DN_NORM"] + [c for c in ["PLAN","COSTO PAQUETE"] if c in altas_mes.columns]
+        hist = altas_mes[hist_cols].rename(columns={"DN_NORM":"DN"}).sort_values("FECHA")
+    else:
+        hist = pd.DataFrame(columns=["FECHA","DN","PLAN","COSTO PAQUETE"])
 
-    # CARTERA MES (detalle de recargas del mes)
-    cartera_mes = rec_month[['FECHA','DN_NORM','PLAN','MONTO','FORMA DE PAGO','VENTANA','ESQUEMA','COMISION_TX']].rename(columns={'DN_NORM':'DN'}).sort_values('FECHA')
+    # CARTERA MES (detalle recargas)
+    if not rec_month.empty:
+        rec_det = rec_month.copy()
+        rec_det["ELEGIBLE_MBB"] = rec_det["MONTO"] >= min_mbb
+        # Traemos PLAN si se conoce por totales
+        plan_map = tot_dist[["DN_NORM","PLAN"]].dropna().drop_duplicates()
+        rec_det = rec_det.merge(plan_map, on="DN_NORM", how="left")
+        rec_det = rec_det[["FECHA","DN_NORM","PLAN","MONTO"] + (["FORMA DE PAGO"] if "FORMA DE PAGO" in rec_det.columns else []) + ["ELEGIBLE_MBB"]]
+        rec_det = rec_det.rename(columns={"DN_NORM":"DN"}).sort_values("FECHA")
+    else:
+        rec_det = pd.DataFrame(columns=["FECHA","DN","PLAN","MONTO","ELEGIBLE_MBB"])
 
-    # Export a Excel
+    # Exportar a Excel en memoria
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        resumen.to_excel(writer, sheet_name='RESUMEN', index=False)
-        anexo.to_excel(writer, sheet_name='ANEXO', index=False)
-        hist_altas_dist.to_excel(writer, sheet_name='HISTORIAL DE ACTIVACIONES', index=False)
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        resumen.to_excel(writer, sheet_name="RESUMEN", index=False)
+        anexo.to_excel(writer, sheet_name="ANEXO", index=False)
+        hist.to_excel(writer, sheet_name="HISTORIAL DE ACTIVACIONES", index=False)
         resumen_mes.to_excel(writer, sheet_name=f'RESUMEN {month_start.strftime("%B").upper()} {year}', index=False)
-        cartera_mes.to_excel(writer, sheet_name=f'CARTERA {month_start.strftime("%B").upper()} {year}', index=False)
+        rec_det.to_excel(writer, sheet_name=f'CARTERA {month_start.strftime("%B").upper()} {year}', index=False)
     output.seek(0)
     return output
 
-# =========================
-# UI
-# =========================
+# ========== UI ==========
 col1, col2 = st.columns(2)
 with col1:
-    base_file = st.file_uploader("1) Base mensual (VT Reporte Comercial…)", type=["xlsx"])
+    base_file = st.file_uploader("📥 Base mensual (VT Reporte Comercial…)", type=["xlsx"])
     st.caption("Debe tener 'Desgloce Totales' (header fila 2) y 'Desgloce Recarga' (header fila 4).")
+    hist_file = st.file_uploader("📥 Historial del distribuidor (opcional, recomendado)", type=["xlsx"])
 with col2:
-    hist_file = st.file_uploader("2) HISTORIAL del distribuidor (Excel ejemplo)", type=["xlsx"])
-    st.caption("Usado para fecha de activación real, ESQUEMA y recargas históricas (si las trae).")
+    st.write("Parámetros")
+    dist = st.text_input("Distribuidor (igual que en la base)", value="ActivateCel")
+    year = st.number_input("Año", min_value=2023, max_value=2100, value=2025, step=1)
+    month = st.number_input("Mes (1–12)", min_value=1, max_value=12, value=6, step=1)
 
-st.write("Parámetros")
-dist = st.text_input("Distribuidor", value="ActivateCel")
-year = st.number_input("Año", min_value=2023, max_value=2100, value=2025, step=1)
-month = st.number_input("Mes (1–12)", min_value=1, max_value=12, value=6, step=1)
+# Info de columnas detectadas (ayuda para debug)
+def show_detected(name, df):
+    st.markdown(f"**{name}** columnas: " + ", ".join(df.columns[:20]))
 
-if st.button("Generar reporte"):
+if base_file:
     try:
-        if not base_file:
-            st.error("Falta cargar la base mensual.")
-        else:
-            # Leer base mensual
-            xls = pd.ExcelFile(base_file, engine="openpyxl")
-            if 'Desgloce Totales' not in xls.sheet_names or 'Desgloce Recarga' not in xls.sheet_names:
-                st.error("El archivo base debe contener 'Desgloce Totales' y 'Desgloce Recarga'.")
-            else:
-                df_tot = pd.read_excel(base_file, sheet_name='Desgloce Totales', header=1, engine="openpyxl")
-                df_rec = pd.read_excel(base_file, sheet_name='Desgloce Recarga', header=3, engine="openpyxl")
+        df_tot, df_rec = load_base(base_file)
+        with st.expander("Columnas detectadas (Base)"):
+            show_detected("Desgloce Totales", df_tot)
+            show_detected("Desgloce Recarga", df_rec)
+    except Exception as e:
+        st.error(f"Error leyendo Base: {e}")
 
-                # Intentar leer historial si viene
-                df_hist_act, df_hist_rec = None, None
-                if hist_file:
-                    xh = pd.ExcelFile(hist_file, engine="openpyxl")
-                    # Heurística: buscar hojas que contengan 'HISTORIAL' y 'CARTERA' / 'RECARGA'
-                    act_sheet = next((s for s in xh.sheet_names if 'HISTORIAL' in s.upper()), None)
-                    rec_sheet = next((s for s in xh.sheet_names if 'CARTERA' in s.upper() or 'RECARGA' in s.upper()), None)
+act_hist = None
+rec_hist = None
+if hist_file:
+    try:
+        ah, rh = load_historial(hist_file)
+        act_hist, rec_hist = ah, rh
+        with st.expander("Columnas detectadas (Historial)"):
+            if not act_hist.empty: show_detected("Activaciones (hist)", act_hist)
+            if not rec_hist.empty: show_detected("Recargas (hist)", rec_hist)
+            if act_hist.empty and rec_hist.empty:
+                st.info("No se detectaron hojas de historial con columnas DN/FECHA/(MONTO). Se usará solo la base mensual.")
+    except Exception as e:
+        st.warning(f"No se pudo interpretar el historial: {e}")
 
-                    if act_sheet:
-                        df_hist_act = pd.read_excel(hist_file, sheet_name=act_sheet, engine="openpyxl")
-                    if rec_sheet:
-                        df_hist_rec = pd.read_excel(hist_file, sheet_name=rec_sheet, engine="openpyxl")
-
-                buf = calc_report(
-                    df_tot=df_tot,
-                    df_rec=df_rec,
-                    df_hist_act=df_hist_act,
-                    df_hist_rec=df_hist_rec,
-                    dist_name=dist,
-                    year=int(year),
-                    month=int(month)
-                )
-
-                fname = f"COMISION VALOR DISTRIBUIDOR {dist.upper()} {datetime(int(year), int(month), 1).strftime('%B').upper()} {year}.xlsx"
-                st.success("Reporte generado.")
-                st.download_button("⬇️ Descargar Excel", data=buf, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if base_file and st.button("Generar reporte"):
+    try:
+        buf = calc_report(
+            df_tot=df_tot,
+            df_rec=df_rec,
+            dist_name=dist,
+            year=int(year),
+            month=int(month),
+            act_hist=act_hist,
+            rec_hist=rec_hist
+        )
+        fname = f"COMISION VALOR DISTRIBUIDOR {dist.upper()} {datetime(int(year), int(month), 1).strftime('%B').upper()} {year}.xlsx"
+        st.success("✅ Reporte generado.")
+        st.download_button("⬇️ Descargar Excel", data=buf, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
         st.exception(e)
