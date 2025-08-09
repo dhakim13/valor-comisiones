@@ -3,39 +3,56 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from openpyxl import load_workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
 
+# =========================
+# Configuración de página
+# =========================
 st.set_page_config(page_title="Valor Telecom - Comisiones", page_icon="📊", layout="wide")
-
 st.title("📊 Generador de Comisiones | Valor Telecom")
-st.caption("Carga la base mensual y la PLANTILLA del distribuidor. Calcula y escribe comisiones en las pestañas originales de la plantilla.")
+st.caption("Carga la base mensual (VT Reporte Comercial…) y, opcionalmente, el archivo del distribuidor (historial). Exporta un Excel con RESUMEN, ANEXO, HISTORIAL, RESUMEN MES y CARTERA MES con formato.")
 
-# ----------------- Helpers -----------------
+# =========================
+# Helpers
+# =========================
 def normalize_dn(series: pd.Series) -> pd.Series:
-    out = series.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    def fix(x):
+    out = series.astype(str).str.replace(r"\.0$", "", regex=True)
+    def fix(x: str) -> str:
         try:
             if "e+" in x.lower():
                 return str(int(float(x)))
             return x.split(".")[0]
-        except:
+        except Exception:
             return x
     return out.apply(fix)
 
-def month_span(year:int, month:int):
-    start = pd.Timestamp(year, month, 1)
-    end   = start + pd.offsets.MonthEnd(1)
-    return start, end
+def classify_row(row: pd.Series) -> str:
+    """
+    Clasificación:
+    - Si TIPO contiene 'MOB' => MBB
+    - Por costo de paquete inferimos HBB/MiFi (ajustable).
+    """
+    tipo = str(row.get("TIPO", "")).upper()
+    costo = row.get("COSTO PAQUETE", np.nan)
+    if "MOB" in tipo:
+        return "MBB"
+    # HBB (ejemplos de precios del tablóide)
+    if costo in [99, 115, 349, 399, 439, 500]:
+        return "HBB"
+    # MiFi (ejemplos)
+    if costo in [110, 120, 160, 245, 375, 480, 620]:
+        return "MiFi"
+    # Default al principal
+    return "MBB"
 
-def days_since_activation(act_date: pd.Timestamp, ref_date: pd.Timestamp):
-    if pd.isna(act_date) or pd.isna(ref_date):
-        return np.nan
-    return (ref_date.normalize() - act_date.normalize()).days + 1
-
-def cartera_pct_mbb(n_altas_mes:int) -> float:
-    # Tiers (sustituyen el 5%; no son adicionales)
+def cartera_pct_mbb(n_altas_mes: int) -> float:
+    """
+    MBB por volumen mensual de altas:
+      <50 -> 3%
+      50–299 -> 5%
+      300–499 -> 7%
+      500–999 -> 8%
+      1000+ -> 10%
+    """
     if n_altas_mes < 50:
         return 0.03
     elif n_altas_mes < 300:
@@ -47,124 +64,193 @@ def cartera_pct_mbb(n_altas_mes:int) -> float:
     else:
         return 0.10
 
-def classify_producto(tipo:str, costo):
-    t = str(tipo or "").upper()
-    if "MOB" in t:
-        return "MBB"
-    # Map por costo de paquete (ajustable)
-    # HBB
-    if costo in [99, 115, 349, 399, 439, 500]:
-        return "HBB"
-    # MiFi
-    if costo in [110, 120, 160, 245, 375, 480, 620]:
-        return "MiFi"
-    # Por defecto asumimos MBB
-    return "MBB"
+# =========================
+# Estilos XLSXWriter
+# =========================
+def best_width(series, minw=10, maxw=40):
+    try:
+        lens = series.astype(str).str.len()
+        return int(min(max(lens.max() + 2, minw), maxw))
+    except Exception:
+        return minw
 
-def es_primera_recarga_en_mes(recargas_dn: pd.DataFrame, fecha_rec: pd.Timestamp) -> bool:
-    # recargas_dn: todas las recargas de ese DN (historia completa)
-    if recargas_dn.empty:
-        return False
-    first_date = recargas_dn["FECHA"].min()
-    return pd.notna(first_date) and (first_date.normalize() == fecha_rec.normalize())
+def apply_common_formats(writer):
+    wb = writer.book
+    fmt_title = wb.add_format({
+        "bold": True, "font_size": 14, "align": "left", "valign": "vcenter"
+    })
+    fmt_subtitle = wb.add_format({
+        "bold": True, "font_size": 10, "font_color": "#666666"
+    })
+    fmt_header = wb.add_format({
+        "bold": True, "bg_color": "#F2F2F2", "border": 1,
+        "align": "center", "valign": "vcenter"
+    })
+    fmt_cell = wb.add_format({"border": 1})
+    fmt_money = wb.add_format({"num_format": "$#,##0.00", "border": 1})
+    fmt_percent = wb.add_format({"num_format": "0.00%", "border": 1})
+    fmt_date = wb.add_format({"num_format": "yyyy-mm-dd", "border": 1})
+    fmt_total = wb.add_format({"bold": True, "border": 1, "bg_color": "#FFF2CC"})
+    fmt_note = wb.add_format({"font_color": "#404040", "italic": True})
+    return {
+        "title": fmt_title, "subtitle": fmt_subtitle, "header": fmt_header,
+        "cell": fmt_cell, "money": fmt_money, "percent": fmt_percent,
+        "date": fmt_date, "total": fmt_total, "note": fmt_note
+    }
 
-def write_df_over_table(ws, df: pd.DataFrame, header_row:int=1):
-    """
-    Reemplaza tabla manteniendo ENCABEZADOS en header_row.
-    - Borra todo debajo del header y vuelve a escribir contenido.
-    - Si la hoja está vacía, escribe encabezados + datos.
-    """
-    # Detectar si hay encabezados existentes en header_row:
-    max_col = df.shape[1]
-    # Limpia todo a partir de header_row+1
-    ws.delete_rows(idx=header_row+1, amount=max(0, ws.max_row - header_row))
-    # Si no hay encabezados en la hoja, escribe nuestros headers
-    existing_headers = [c.value for c in ws[header_row]]
-    if not any(existing_headers):
-        # Hoja sin encabezado: escribimos encabezados de df
-        rows = dataframe_to_rows(df, index=False, header=True)
-    else:
-        # Hoja con encabezado: escribe SOLO datos (sin header)
-        rows = dataframe_to_rows(df, index=False, header=False)
-    start_row = header_row + (0 if not any(existing_headers) else 1)
-    r = start_row
-    for row in rows:
-        # rows puede incluir filas vacías si header=True; filtramos vacías
-        if all([x is None for x in row]):
-            continue
-        ws.append(row)
-        r += 1
+def write_df_sheet(
+    writer, df, sheet_name,
+    money_cols=None, percent_cols=None, date_cols=None,
+    freeze_panes=(1,0), add_filter=True, add_total_row=False, total_label="TOTAL"
+):
+    """Escribe un DataFrame con encabezado estilizado, bordes, anchos y formatos."""
+    if money_cols is None: money_cols = []
+    if percent_cols is None: percent_cols = []
+    if date_cols is None: date_cols = []
 
-def spanish_month_upper(dt: pd.Timestamp) -> str:
-    meses = ["ENERO","FEBRERO","MARZO","ABRIL","MAYO","JUNIO","JULIO","AGOSTO","SEPTIEMBRE","OCTUBRE","NOVIEMBRE","DICIEMBRE"]
-    return meses[dt.month-1]
+    formats = apply_common_formats(writer)
+    df_to_write = df.copy()
 
-# ----------------- Core calc -----------------
-def calc_report(df_tot: pd.DataFrame,
-                df_rec: pd.DataFrame,
-                df_rec_hist: pd.DataFrame,
-                dist_name: str,
-                year: int,
-                month: int):
+    # Escribir datos crudos sin índices
+    df_to_write.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
+    ws = writer.sheets[sheet_name]
+    wb = writer.book
+
+    # Encabezados estilizados
+    for col_idx, col_name in enumerate(df_to_write.columns):
+        ws.write(0, col_idx, col_name, formats["header"])
+
+    # Bordes/formato por columnas + ancho
+    for col_idx, col_name in enumerate(df_to_write.columns):
+        col_data = df_to_write[col_name]
+        width = best_width(col_data)
+        ws.set_column(col_idx, col_idx, width)
+
+        # Detecta rango de celdas con datos
+        nrows = len(df_to_write)
+        if nrows > 0:
+            rng = (1, col_idx, nrows, col_idx)  # (row_first, col_first, row_last, col_last)
+            col_format = formats["cell"]
+            if col_name in money_cols:
+                col_format = formats["money"]
+            elif col_name in percent_cols:
+                col_format = formats["percent"]
+            elif col_name in date_cols:
+                col_format = formats["date"]
+            ws.conditional_format(rng[0], rng[1], rng[2], rng[3], {"type": "no_errors", "format": col_format})
+
+    # Filtros
+    if add_filter and len(df_to_write.columns) > 0:
+        ws.autofilter(0, 0, len(df_to_write), len(df_to_write.columns)-1)
+
+    # Panes congelados
+    if freeze_panes:
+        ws.freeze_panes(*freeze_panes)
+
+    # Fila de totales
+    if add_total_row and len(df_to_write) > 0:
+        last_row = len(df_to_write) + 1  # por startrow=1
+        ws.write(last_row, 0, total_label, formats["total"])
+        for col_idx, col_name in enumerate(df_to_write.columns[1:], start=1):
+            # suma si es numérica
+            if pd.api.types.is_numeric_dtype(df_to_write[col_name]):
+                col_letter = xlsx_col_letter(col_idx)
+                ws.write_formula(last_row, col_idx, f"=SUBTOTAL(9,{col_letter}2:{col_letter}{last_row})", formats["total"])
+
+def xlsx_col_letter(idx):
+    # 0 -> A, 1 -> B, ...
+    letters = ""
+    idx += 1
+    while idx:
+        idx, rem = divmod(idx-1, 26)
+        letters = chr(65+rem) + letters
+    return letters
+
+# =========================
+# Núcleo de cálculo
+# =========================
+def calc_report(
+    df_tot: pd.DataFrame,
+    df_rec: pd.DataFrame,
+    dist_name: str,
+    year: int,
+    month: int,
+    hist_activ: pd.DataFrame | None = None,
+    hist_rec: pd.DataFrame | None = None,
+) -> BytesIO:
+
+    month_start = pd.Timestamp(year, month, 1)
+    month_end   = month_start + pd.offsets.MonthEnd(1)
+
+    # --------- Normalización y llaves ---------
+    df_tot = df_tot.copy()
+    df_rec = df_rec.copy()
+
     # Fechas
-    month_start, month_end = month_span(year, month)
-    month_label_up = f"{spanish_month_upper(month_start)} {year}"
-
-    # Normalización
-    dft = df_tot.copy()
-    dfr = df_rec.copy()
-    dfrh = df_rec_hist.copy() if df_rec_hist is not None else pd.DataFrame(columns=dfr.columns)
-
-    # Cast fechas
-    for df in (dft, dfr, dfrh):
-        if not df.empty and "FECHA" in df.columns:
-            df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+    if "FECHA" in df_tot.columns:
+        df_tot["FECHA"] = pd.to_datetime(df_tot["FECHA"], errors="coerce")
+    if "FECHA" in df_rec.columns:
+        df_rec["FECHA"] = pd.to_datetime(df_rec["FECHA"], errors="coerce")
 
     # DN normalizado
-    for df in (dft, dfr, dfrh):
-        if not df.empty and "DN" in df.columns:
-            df["DN_NORM"] = normalize_dn(df["DN"])
+    if "DN" not in df_tot.columns:
+        raise ValueError("En 'Desgloce Totales' falta la columna 'DN'.")
+    if "DN" not in df_rec.columns:
+        raise ValueError("En 'Desgloce Recarga' falta la columna 'DN'.")
 
-    # Columnas mínimas esperadas
-    # dft: FECHA (activación), PLAN, COSTO PAQUETE, DISTRIBUIDOR , TIPO, DN
-    # dfr/dfrh: FECHA (recarga), PLAN, MONTO, FORMA DE PAGO, DN
-    # Filtro distribuidor
-    if "DISTRIBUIDOR " in dft.columns:
-        mask_dist = dft["DISTRIBUIDOR "].astype(str).str.strip().str.lower() == dist_name.lower()
+    df_tot["DN_NORM"] = normalize_dn(df_tot["DN"])
+    df_rec["DN_NORM"] = normalize_dn(df_rec["DN"])
+
+    # --------- Filtro por distribuidor ---------
+    col_dist = "DISTRIBUIDOR " if "DISTRIBUIDOR " in df_tot.columns else "DISTRIBUIDOR"
+    if col_dist not in df_tot.columns:
+        raise ValueError("No encuentro la columna de distribuidor en 'Desgloce Totales'.")
+
+    mask_dist = df_tot[col_dist].astype(str).str.strip().str.lower() == dist_name.strip().lower()
+    tot_dist = df_tot[mask_dist].copy()
+    dns_dist = set(tot_dist["DN_NORM"].dropna()) if not tot_dist.empty else set()
+
+    # --------- Activaciones y Recargas del mes ---------
+    altas_mes = (
+        tot_dist[(tot_dist.get("FECHA") >= month_start) & (tot_dist.get("FECHA") <= month_end)].copy()
+        if "FECHA" in tot_dist.columns else tot_dist.iloc[0:0].copy()
+    )
+
+    rec_month_base = (
+        df_rec[(df_rec.get("FECHA") >= month_start) & (df_rec.get("FECHA") <= month_end)].copy()
+        if "FECHA" in df_rec.columns else df_rec.iloc[0:0].copy()
+    )
+    rec_month_dist = rec_month_base[rec_month_base["DN_NORM"].isin(dns_dist)].copy()
+
+    # --------- Clasificación de producto ---------
+    if not tot_dist.empty:
+        tot_dist["PRODUCTO"] = tot_dist.apply(classify_row, axis=1)
     else:
-        # fallback por si columna viene sin espacio final
-        mask_dist = dft.get("DISTRIBUIDOR","").astype(str).str.strip().str.lower() == dist_name.lower()
+        tot_dist["PRODUCTO"] = []
 
-    dft_dist = dft[mask_dist].copy()
-    dft_dist["PRODUCTO"] = dft_dist.apply(lambda r: classify_producto(r.get("TIPO",""), r.get("COSTO PAQUETE", np.nan)), axis=1)
-    dns_dist = set(dft_dist["DN_NORM"].dropna())
-
-    # Altas del mes (por fecha de activación dentro del mes)
-    altas_mes = dft_dist[(dft_dist["FECHA"]>=month_start) & (dft_dist["FECHA"]<=month_end)].copy()
-    n_altas_mes = altas_mes["DN_NORM"].nunique()
-
-    # Recargas del mes (base mensual + histórico cruzado por DNs del distribuidor)
-    rec_month_base = dfr[(dfr["FECHA"]>=month_start) & (dfr["FECHA"]<=month_end)].copy()
-    rec_month_hist = dfrh[(dfrh["FECHA"]>=month_start) & (dfrh["FECHA"]<=month_end)].copy() if not dfrh.empty else pd.DataFrame(columns=rec_month_base.columns)
-    rec_month = pd.concat([rec_month_base, rec_month_hist], ignore_index=True)
-    rec_month_dist = rec_month[rec_month["DN_NORM"].isin(dns_dist)].copy()
-
-    # % cartera MBB para este distribuidor según altas del mes
-    pct_mbb = cartera_pct_mbb(n_altas_mes)
-
-    # Mínimos por producto
+    # --------- Reglas de negocio ---------
+    n_altas = altas_mes["DN_NORM"].nunique() if not altas_mes.empty else 0
+    pct_mbb = cartera_pct_mbb(n_altas)
     min_mbb = 35
     min_mifi = 110
-    min_hbb  = 99
+    min_hbb = 99
 
-    # ----------------- ANEXO -----------------
-    # Suma recarga por DN dentro del mes
-    rec_by_dn = rec_month_dist.groupby("DN_NORM", as_index=False)["MONTO"].sum().rename(columns={"MONTO":"RECARGA_TOTAL_MES"})
-    anexo = dft_dist[["DN","DN_NORM","FECHA","PLAN","COSTO PAQUETE","PRODUCTO"]].merge(rec_by_dn, on="DN_NORM", how="left")
+    # Suma de recargas del mes por DN
+    rec_by_dn = (
+        rec_month_dist.groupby("DN_NORM", as_index=False)["MONTO"]
+        .sum()
+        .rename(columns={"MONTO": "RECARGA_TOTAL_MES"})
+    )
+
+    # --------- ANEXO (detalle por línea del universo del distribuidor) ---------
+    cols_keep = [c for c in ["DN", "DN_NORM", "FECHA", "PLAN", "COSTO PAQUETE", "PRODUCTO"] if c in tot_dist.columns]
+    if "DN_NORM" not in cols_keep:
+        cols_keep.insert(1, "DN_NORM")
+    anexo = tot_dist[cols_keep].merge(rec_by_dn, on="DN_NORM", how="left")
     anexo["RECARGA_TOTAL_MES"] = anexo["RECARGA_TOTAL_MES"].fillna(0.0)
 
-    # Elegibilidad cartera y % aplicado
-    def elegible_row(row):
+    # Elegibilidad cartera por producto
+    def elegible(row):
         if row["PRODUCTO"] == "MBB":
             return row["RECARGA_TOTAL_MES"] >= min_mbb
         elif row["PRODUCTO"] == "MiFi":
@@ -173,215 +259,233 @@ def calc_report(df_tot: pd.DataFrame,
             return row["RECARGA_TOTAL_MES"] >= min_hbb
         return False
 
-    def pct_aplicado_row(row):
+    anexo["ELEGIBLE_CARTERA"] = anexo.apply(elegible, axis=1)
+
+    # % aplicado
+    def pct_aplicado(row):
         if row["PRODUCTO"] == "MBB":
             return pct_mbb
-        elif row["PRODUCTO"] in ("MiFi","HBB"):
+        elif row["PRODUCTO"] in ("MiFi", "HBB"):
             return 0.05
         return 0.0
 
-    anexo["ELEGIBLE_CARTERA"] = anexo.apply(elegible_row, axis=1)
-    anexo["% CARTERA APLICADA"] = anexo.apply(pct_aplicado_row, axis=1)
+    anexo["% CARTERA APLICADA"] = anexo.apply(pct_aplicado, axis=1)
     anexo["COMISION_CARTERA_$"] = np.where(
         anexo["ELEGIBLE_CARTERA"],
         anexo["RECARGA_TOTAL_MES"] * anexo["% CARTERA APLICADA"],
         0.0
     ).round(2)
 
-    # ----------------- Bono MiFi $50 (10GB + 1a recarga día 31–60) -----------------
-    # Detectamos potenciales líneas de plan 10GB por Costo Paquete 120
-    # y verificamos si su PRIMERA recarga (global) cae dentro de 31–60 días desde activación
-    # y además la primera recarga cae dentro del mes calculado (para pagarla en ese mes).
-    # Tomamos historia de recargas completa (dfr + dfrh).
-    rec_hist_all = pd.concat([dfr, dfrh], ignore_index=True)
-    if not rec_hist_all.empty:
-        rec_hist_all = rec_hist_all[rec_hist_all["DN_NORM"].isin(dns_dist)].copy()
+    # --------- RESUMEN (portada) ---------
+    rec_total_mes = float(rec_month_dist["MONTO"].sum()) if "MONTO" in rec_month_dist.columns else 0.0
+    com_total = float(anexo["COMISION_CARTERA_$"].sum()) if not anexo.empty else 0.0
 
-    # Primera recarga global por DN
-    first_rec = (
-        rec_hist_all.sort_values("FECHA")
-        .groupby("DN_NORM", as_index=False)
-        .agg(FirstRecargaFecha=("FECHA","first"),
-             FirstRecargaMonto=("MONTO","first"))
-    )
-
-    # Merge al anexo
-    anexo = anexo.merge(first_rec, on="DN_NORM", how="left")
-
-    # Días desde activación a 1ª recarga
-    anexo["DIAS_A_PRIMERA_REC"] = (
-        anexo.apply(lambda r: days_since_activation(r["FECHA"], r["FirstRecargaFecha"]), axis=1)
-    )
-
-    # Condiciones de bono:
-    # - Producto MiFi
-    # - Costo Paquete == 120 (10GB)
-    # - 1ª recarga entre 31 y 60 días inclusive
-    # - Y esa primera recarga ocurre dentro del mes en cálculo (para pagar ese mes)
-    cond_bono = (
-        (anexo["PRODUCTO"]=="MiFi") &
-        (anexo["COSTO PAQUETE"]==120) &
-        (anexo["DIAS_A_PRIMERA_REC"].between(31,60, inclusive="both")) &
-        (anexo["FirstRecargaFecha"]>=month_start) &
-        (anexo["FirstRecargaFecha"]<=month_end)
-    )
-    anexo["BONO_MIFI_50_$"] = np.where(cond_bono, 50.0, 0.0)
-
-    # Comisión total línea (cartera + bono)
-    anexo["COMISION_TOTAL_$"] = (anexo["COMISION_CARTERA_$"] + anexo["BONO_MIFI_50_$"]).round(2)
-
-    # ----------------- RESUMEN -----------------
     resumen = pd.DataFrame([{
         "Distribuidor": dist_name,
-        "Mes": f'{month_start.strftime("%B").capitalize()} {year}',
-        "Altas del mes": int(n_altas_mes),
-        "Recargas totales del mes ($)": round(rec_month_dist["MONTO"].sum(),2),
+        "Mes": f"{month_start.strftime('%B').capitalize()} {year}",
+        "Altas del mes": int(n_altas),
+        "Recargas totales del mes ($)": round(rec_total_mes, 2),
         "Porcentaje Cartera aplicado (MBB)": pct_mbb,
-        "Comisión Cartera total ($)": round(anexo["COMISION_CARTERA_$"].sum(),2),
-        "Bonos MiFi ($)": round(anexo["BONO_MIFI_50_$"].sum(),2),
-        "Comisión Total ($)": round(anexo["COMISION_TOTAL_$"].sum(),2)
+        "Comisión Cartera total ($)": round(com_total, 2)
     }])
 
-    # ----------------- RESUMEN MES (por producto) -----------------
-    resumen_mes = (
-        anexo.groupby("PRODUCTO", as_index=False)
-            .agg(Lineas=("DN_NORM","nunique"),
-                 Recarga_Mes_$=("RECARGA_TOTAL_MES","sum"),
-                 Comision_Cartera_$=("COMISION_CARTERA_$","sum"),
-                 Bono_MiFi_$=("BONO_MIFI_50_$","sum"),
-                 Comision_Total_$=("COMISION_TOTAL_$","sum"))
-            .sort_values("PRODUCTO")
-    )
-    tot_row = pd.DataFrame([{
-        "PRODUCTO":"TOTAL",
-        "Lineas": resumen_mes["Lineas"].sum(),
-        "Recarga_Mes_$": resumen_mes["Recarga_Mes_$"].sum(),
-        "Comision_Cartera_$": resumen_mes["Comision_Cartera_$"].sum(),
-        "Bono_MiFi_$": resumen_mes["Bono_MiFi_$"].sum(),
-        "Comision_Total_$": resumen_mes["Comision_Total_$"].sum()
+    # --------- RESUMEN MES (agregado por producto + total)
+    if not anexo.empty:
+        resumen_mes = (
+            anexo.groupby("PRODUCTO", as_index=False)
+            .agg(**{
+                "Lineas": ("DN_NORM", "nunique"),
+                "Recarga_Mes_$": ("RECARGA_TOTAL_MES", "sum"),
+                "Comision_Cartera_$": ("COMISION_CARTERA_$", "sum"),
+            })
+        )
+    else:
+        resumen_mes = pd.DataFrame(columns=["PRODUCTO", "Lineas", "Recarga_Mes_$", "Comision_Cartera_$"])
+
+    total_row = pd.DataFrame([{
+        "PRODUCTO": "TOTAL",
+        "Lineas": resumen_mes["Lineas"].sum() if not resumen_mes.empty else 0,
+        "Recarga_Mes_$": resumen_mes["Recarga_Mes_$"].sum() if not resumen_mes.empty else 0.0,
+        "Comision_Cartera_$": resumen_mes["Comision_Cartera_$"].sum() if not resumen_mes.empty else 0.0
     }])
-    resumen_mes = pd.concat([resumen_mes, tot_row], ignore_index=True)
+    resumen_mes = pd.concat([resumen_mes, total_row], ignore_index=True)
 
-    # ----------------- HISTORIAL DE ACTIVACIONES (solo mes) -----------------
-    hist_acts = altas_mes[["FECHA","DN_NORM","PLAN","COSTO PAQUETE"]].rename(columns={"DN_NORM":"DN"}).sort_values("FECHA")
+    # --------- HISTORIAL DE ACTIVACIONES (del mes) ---------
+    if hist_activ is not None and not hist_activ.empty:
+        hist = hist_activ.copy()
+        if "FECHA" in hist.columns:
+            hist["FECHA"] = pd.to_datetime(hist["FECHA"], errors="coerce")
+            hist = hist[(hist["FECHA"] >= month_start) & (hist["FECHA"] <= month_end)].copy()
+        if "FECHA" in hist.columns:
+            hist = hist.sort_values("FECHA")
+        # Normaliza nombre de DN si viniera como 'DN_NORM'
+        if "DN_NORM" in hist.columns and "DN" not in hist.columns:
+            hist = hist.rename(columns={"DN_NORM": "DN"})
+    else:
+        base_cols = []
+        if "FECHA" in altas_mes.columns: base_cols.append("FECHA")
+        if "DN_NORM" in altas_mes.columns: base_cols.append("DN_NORM")
+        if "PLAN" in altas_mes.columns: base_cols.append("PLAN")
+        if "COSTO PAQUETE" in altas_mes.columns: base_cols.append("COSTO PAQUETE")
+        hist = altas_mes[base_cols].rename(columns={"DN_NORM": "DN"}) if base_cols else pd.DataFrame(columns=["FECHA","DN","PLAN","COSTO PAQUETE"])
+        if "FECHA" in hist.columns:
+            hist = hist.sort_values("FECHA")
 
-    # ----------------- CARTERA MES (detalle recargas del mes) -----------------
+    # --------- CARTERA {MES} (detalle recargas del mes)
     rec_det = rec_month_dist.copy()
-    rec_det["DN"] = rec_det["DN_NORM"]
-    rec_det["ELEGIBLE_MBB"] = rec_det["MONTO"] >= min_mbb
-    rec_det = rec_det[["FECHA","DN","PLAN","MONTO","FORMA DE PAGO","ELEGIBLE_MBB"]].sort_values("FECHA")
-
-    # Ajustes finales de redondeo
-    for col in ["RECARGA_TOTAL_MES","COMISION_CARTERA_$","BONO_MIFI_50_$","COMISION_TOTAL_$",
-                "Recarga_Mes_$","Comision_Cartera_$","Bono_MiFi_$","Comision_Total_$",
-                "MONTO"]:
-        if col in anexo.columns:
-            anexo[col] = anexo[col].round(2)
-        if col in resumen_mes.columns:
-            resumen_mes[col] = resumen_mes[col].round(2)
-        if col in rec_det.columns:
-            rec_det[col] = rec_det[col].round(2)
-
-    return {
-        "RESUMEN": resumen,
-        "ANEXO": anexo[[
-            "DN","DN_NORM","FECHA","PLAN","COSTO PAQUETE","PRODUCTO",
-            "RECARGA_TOTAL_MES","ELEGIBLE_CARTERA","% CARTERA APLICADA",
-            "COMISION_CARTERA_$","BONO_MIFI_50_$","COMISION_TOTAL_$",
-            "FirstRecargaFecha","DIAS_A_PRIMERA_REC"
-        ]],
-        "HISTORIAL DE ACTIVACIONES": hist_acts,
-        f"RESUMEN {month_label_up}": resumen_mes,
-        f"CARTERA {month_label_up}": rec_det
-    }
-
-def render_into_template(template_file, dataframes: dict, header_row_by_sheet: dict=None) -> BytesIO:
-    """
-    Abre la PLANTILLA con openpyxl y reemplaza el contenido de las hojas indicadas,
-    respetando encabezados. Si header_row_by_sheet no se da, asume encabezado en fila 1.
-    """
-    wb = load_workbook(template_file)
-    for sheet_name, df in dataframes.items():
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
+    if not rec_det.empty:
+        rec_det["ELEGIBLE_MBB"] = rec_det["MONTO"] >= min_mbb if "MONTO" in rec_det.columns else False
+        keep = [c for c in ["FECHA", "DN_NORM", "PLAN", "MONTO", "FORMA DE PAGO"] if c in rec_det.columns]
+        if "DN_NORM" in keep:
+            rec_det = rec_det[keep].rename(columns={"DN_NORM": "DN"})
         else:
-            # si no existe, la creamos (pero idealmente ya existen en la plantilla)
-            ws = wb.create_sheet(title=sheet_name)
-        header_row = 1
-        if header_row_by_sheet and sheet_name in header_row_by_sheet:
-            header_row = header_row_by_sheet[sheet_name]
-        write_df_over_table(ws, df, header_row=header_row)
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out
+            rec_det = rec_det[keep]
+        if "FECHA" in rec_det.columns:
+            rec_det = rec_det.sort_values("FECHA")
+    else:
+        rec_det = pd.DataFrame(columns=["FECHA", "DN", "PLAN", "MONTO", "FORMA DE PAGO", "ELEGIBLE_MBB"])
 
-# ----------------- UI -----------------
+    # =========================
+    # Exportar a Excel (memoria) con estilos
+    # =========================
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        fmts = apply_common_formats(writer)
+
+        # 1) RESUMEN (portada tipo cuadro)
+        sheet_name_resumen = "RESUMEN"
+        resumen.to_excel(writer, sheet_name=sheet_name_resumen, index=False, startrow=5)
+        ws = writer.sheets[sheet_name_resumen]
+
+        # Título
+        title = f"COMISIONES {dist_name.upper()} — {month_start.strftime('%B').upper()} {year}"
+        ws.write(0, 0, title, fmts["title"])
+        ws.write(2, 0, "Este reporte incluye: ANEXO (detalle líneas), HISTORIAL DE ACTIVACIONES, RESUMEN y CARTERA del mes.", fmts["subtitle"])
+
+        # Dar formato a columnas
+        # Moneda/porcentaje por nombre de columna
+        if "Recargas totales del mes ($)" in resumen.columns:
+            col_idx = resumen.columns.get_loc("Recargas totales del mes ($)")
+            ws.set_column(col_idx, col_idx, 20, fmts["money"])
+        if "Comisión Cartera total ($)" in resumen.columns:
+            col_idx = resumen.columns.get_loc("Comisión Cartera total ($)")
+            ws.set_column(col_idx, col_idx, 20, fmts["money"])
+        if "Porcentaje Cartera aplicado (MBB)" in resumen.columns:
+            col_idx = resumen.columns.get_loc("Porcentaje Cartera aplicado (MBB)")
+            ws.set_column(col_idx, col_idx, 15, fmts["percent"])
+
+        # Encabezado tipo header
+        for col_idx, col_name in enumerate(resumen.columns):
+            ws.write(5, col_idx, col_name, fmts["header"])
+            ws.set_column(col_idx, col_idx, max(15, best_width(resumen[col_name])))
+
+        # 2) ANEXO
+        money_cols_anexo = ["RECARGA_TOTAL_MES", "COMISION_CARTERA_$"]
+        percent_cols_anexo = ["% CARTERA APLICADA"]
+        date_cols_anexo = ["FECHA"] if "FECHA" in anexo.columns else []
+        write_df_sheet(
+            writer, anexo, "ANEXO",
+            money_cols=money_cols_anexo,
+            percent_cols=percent_cols_anexo,
+            date_cols=date_cols_anexo,
+            freeze_panes=(1,0),
+            add_filter=True,
+            add_total_row=True,
+            total_label="TOTAL"
+        )
+
+        # 3) HISTORIAL DE ACTIVACIONES
+        date_cols_hist = ["FECHA"] if "FECHA" in hist.columns else []
+        write_df_sheet(
+            writer, hist, "HISTORIAL DE ACTIVACIONES",
+            date_cols=date_cols_hist,
+            add_filter=True,
+            freeze_panes=(1,0),
+            add_total_row=False
+        )
+
+        # 4) RESUMEN {MES}
+        sheet_name_resumen_mes = f"RESUMEN {month_start.strftime('%B').upper()} {year}"
+        money_cols_resumen_mes = ["Recarga_Mes_$", "Comision_Cartera_$"]
+        write_df_sheet(
+            writer, resumen_mes, sheet_name_resumen_mes,
+            money_cols=money_cols_resumen_mes,
+            add_filter=True,
+            freeze_panes=(1,0),
+            add_total_row=False
+        )
+
+        # 5) CARTERA {MES}
+        sheet_name_cartera_mes = f"CARTERA {month_start.strftime('%B').upper()} {year}"
+        date_cols_cartera = ["FECHA"] if "FECHA" in rec_det.columns else []
+        money_cols_cartera = ["MONTO"] if "MONTO" in rec_det.columns else []
+        write_df_sheet(
+            writer, rec_det, sheet_name_cartera_mes,
+            date_cols=date_cols_cartera,
+            money_cols=money_cols_cartera,
+            add_filter=True,
+            freeze_panes=(1,0),
+            add_total_row=True,
+            total_label="TOTAL"
+        )
+
+    output.seek(0)
+    return output
+
+# =========================
+# UI
+# =========================
 col1, col2 = st.columns(2)
 with col1:
-    base_file = st.file_uploader("Base mensual (VT Reporte Comercial…)", type=["xlsx"])
-    st.caption("Debe contener: 'Desgloce Totales' (header fila 2) y 'Desgloce Recarga' (header fila 4).")
+    base_file = st.file_uploader("Base mensual (VT Reporte Comercial…)", type=["xlsx"], key="base")
+    st.caption("Debe incluir: 'Desgloce Totales' (header fila 2) y 'Desgloce Recarga' (header fila 4).")
+    hist_file = st.file_uploader("Archivo del distribuidor (historial) - opcional", type=["xlsx"], key="hist")
+    st.caption("Si lo subes, usaré sus hojas para HISTORIAL; si no, lo construyo desde la base.")
+
 with col2:
-    template_file = st.file_uploader("PLANTILLA del distribuidor (Excel con todas las pestañas)", type=["xlsx"])
+    st.write("Parámetros")
     dist = st.text_input("Distribuidor", value="ActivateCel")
     year = st.number_input("Año", min_value=2023, max_value=2100, value=2025, step=1)
     month = st.number_input("Mes (1–12)", min_value=1, max_value=12, value=6, step=1)
 
-st.markdown("---")
-
-hist_file = st.file_uploader("Opcional: **Histórico de recargas** del distribuidor (si existe en otro Excel). Si viene dentro de la base, puedes dejar vacío.", type=["xlsx"], help="Si no lo cargas, la app sólo usará 'Desgloce Recarga' de la base para buscar la primera recarga.")
-
-if base_file and template_file and st.button("Generar reporte en PLANTILLA"):
+if base_file and st.button("Generar reporte"):
     try:
-        # Leer base
-        xls = pd.ExcelFile(base_file, engine="openpyxl")
-        if "Desgloce Totales" not in xls.sheet_names or "Desgloce Recarga" not in xls.sheet_names:
+        # Leer base (con encabezados en filas específicas)
+        xls_base = pd.ExcelFile(base_file, engine="openpyxl")
+        if ("Desgloce Totales" not in xls_base.sheet_names) or ("Desgloce Recarga" not in xls_base.sheet_names):
             st.error("El archivo base debe contener las hojas 'Desgloce Totales' y 'Desgloce Recarga'.")
         else:
             df_tot = pd.read_excel(base_file, sheet_name="Desgloce Totales", header=1, engine="openpyxl")
             df_rec = pd.read_excel(base_file, sheet_name="Desgloce Recarga", header=3, engine="openpyxl")
 
-            # Histórico (si se sube aparte). Si no, usamos sólo df_rec para primera recarga.
-            if hist_file:
-                # Buscamos una hoja que tenga columnas compatibles; si no sabemos el nombre, tomamos la primera
-                xh = pd.ExcelFile(hist_file, engine="openpyxl")
-                # intenta detectar por columnas
-                df_hist = None
-                for sh in xh.sheet_names:
-                    tmp = pd.read_excel(hist_file, sheet_name=sh, engine="openpyxl")
-                    cols = {c.upper().strip() for c in tmp.columns.astype(str)}
-                    if {"FECHA","DN","MONTO"}.issubset(cols):
-                        df_hist = tmp
-                        break
-                if df_hist is None:
-                    # fallback: primera hoja
-                    df_hist = pd.read_excel(hist_file, sheet_name=0, engine="openpyxl")
-            else:
-                df_hist = pd.DataFrame(columns=df_rec.columns)
+            # Historial (opcional)
+            hist_activ = None
+            hist_rec = None
+            if hist_file is not None:
+                try:
+                    xls_hist = pd.ExcelFile(hist_file, engine="openpyxl")
+                    if "HISTORIAL DE ACTIVACIONES" in xls_hist.sheet_names:
+                        hist_activ = pd.read_excel(hist_file, sheet_name="HISTORIAL DE ACTIVACIONES", engine="openpyxl")
+                    # Si existiera hoja de recargas histórica
+                    for cand in ["DETALLE RECARGAS", "CARTERA", f"CARTERA {datetime(int(year), int(month), 1).strftime('%B').upper()} {int(year)}"]:
+                        if cand in xls_hist.sheet_names:
+                            hist_rec = pd.read_excel(hist_file, sheet_name=cand, engine="openpyxl")
+                            break
+                except Exception:
+                    hist_activ, hist_rec = None, None
 
-            result = calc_report(
+            buf = calc_report(
                 df_tot=df_tot,
                 df_rec=df_rec,
-                df_rec_hist=df_hist,
                 dist_name=dist,
                 year=int(year),
-                month=int(month)
+                month=int(month),
+                hist_activ=hist_activ,
+                hist_rec=hist_rec
             )
+            fname = f"COMISION VALOR DISTRIBUIDOR {dist.upper()} {datetime(int(year), int(month), 1).strftime('%B').upper()} {int(year)}.xlsx"
+            st.success("✅ Reporte generado.")
+            st.download_button("⬇️ Descargar Excel", data=buf, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # Si tu plantilla tiene encabezados en otra fila, mapea aquí:
-            header_rows = {
-                # "RESUMEN": 1,
-                # "ANEXO": 1,
-                # "HISTORIAL DE ACTIVACIONES": 1,
-                # f"RESUMEN {spanish_month_upper(pd.Timestamp(int(year),int(month),1))} {int(year)}": 1,
-                # f"CARTERA {spanish_month_upper(pd.Timestamp(int(year),int(month),1))} {int(year)}": 1
-            }
-
-            output = render_into_template(template_file, result, header_row_by_sheet=header_rows)
-            fname = f"COMISION VALOR DISTRIBUIDOR {dist.upper()} {spanish_month_upper(pd.Timestamp(int(year),int(month),1))} {int(year)}.xlsx"
-            st.success("✅ Reporte generado en la PLANTILLA.")
-            st.download_button("⬇️ Descargar Excel", data=output, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
         st.exception(e)
-else:
-    st.info("Sube **Base mensual** y **PLANTILLA** del distribuidor, ajusta parámetros y presiona **Generar**.")
